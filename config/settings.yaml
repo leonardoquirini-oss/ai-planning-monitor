@@ -1,0 +1,33 @@
+# Planning Agent API (ai-planner esistente)
+planner:
+  base_url: "http://192.168.0.14:8602"
+  timeout: 120.0
+
+# BERLink API
+berlink:
+  base_url: "http://192.168.0.12:9095"
+  api_key: "0e223634-4c2a-44f2-8139-960f03964933"
+  timeout: 60.0
+
+# LLM (OpenRouter)
+llm:
+  provider: "openrouter"
+  base_url: "https://openrouter.ai/api/v1"
+  model: "anthropic/claude-3-5-haiku"
+  temperature: 0.1
+  max_tokens: 2000
+
+# Server HTTP (tool endpoint)
+server:
+  host: "0.0.0.0"
+  port: 8610
+
+# Monitor
+monitor:
+  check_interval_seconds: 300
+  notification_receivers:
+    - username_receiver: "b.guido"
+  dedup_ttl_hours: 8
+  checks:
+    eta_orari:
+      enabled: true
