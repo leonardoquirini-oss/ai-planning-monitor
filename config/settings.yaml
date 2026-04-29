@@ -3,10 +3,16 @@ planner:
   base_url: "http://192.168.0.14:8602"
   timeout: 120.0
 
-# BERLink API
+# BERLink Connector (accesso DB)
 berlink:
   base_url: "http://192.168.0.12:9095"
   api_key: "0e223634-4c2a-44f2-8139-960f03964933"
+  timeout: 60.0
+
+# BERLink API (notifiche)
+berlink_notifications:
+  base_url: "http://192.168.0.12:8090"
+  api_key: "jpm7YIedQgwcu44WpJirqt3x4Y7dcmdcaZ7tMIsa6x4"
   timeout: 60.0
 
 # LLM (OpenRouter)
@@ -26,7 +32,7 @@ server:
 monitor:
   check_interval_seconds: 300
   notification_receivers:
-    - username_receiver: "b.guido"
+    - username_receiver: "leonardo.q"
   dedup_ttl_hours: 8
   checks:
     eta_orari:

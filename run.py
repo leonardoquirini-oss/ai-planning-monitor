@@ -75,7 +75,7 @@ def serve(
 
 @app.command()
 def daemon(
-    interval: int = typer.Option(300, "--interval", "-i", help="Secondi tra cicli"),
+    interval: int = typer.Option(None, "--interval", "-i", help="Secondi tra cicli (default da config)"),
     notify: bool = typer.Option(True, "--notify", "-n"),
     no_llm: bool = typer.Option(False, "--no-llm"),
 ):
@@ -83,7 +83,11 @@ def daemon(
     import signal
     import time
 
-    from monitor.engine import run_check
+    from monitor.engine import load_config, run_check
+
+    config = load_config()
+    if interval is None:
+        interval = config.get("monitor", {}).get("check_interval_seconds", 300)
 
     running = True
 

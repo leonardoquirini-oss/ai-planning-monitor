@@ -64,10 +64,14 @@ def run_check(
         config["planner"]["base_url"],
         timeout=config["planner"].get("timeout", 120.0),
     )
+    notif_cfg = config.get("berlink_notifications", {})
     berlink = BERLinkClient(
         config["berlink"]["base_url"],
         config["berlink"]["api_key"],
         timeout=config["berlink"].get("timeout", 60.0),
+        notifications_base_url=notif_cfg.get("base_url"),
+        notifications_api_key=notif_cfg.get("api_key"),
+        notifications_timeout=notif_cfg.get("timeout"),
     )
 
     data_obj = date.fromisoformat(data) if data else date.today()
@@ -85,11 +89,18 @@ def run_check(
     )
 
     # 2. Check deterministici
+    checks_config = config.get("monitor", {}).get("checks", {})
     all_alerts: List[CheckAlert] = []
     checks_eseguiti = 0
     for check in get_registered_checks():
         if checks and check.name not in checks:
             continue
+        # Se non richiesti check specifici via CLI, rispetta enabled da config
+        if not checks:
+            check_cfg = checks_config.get(check.name, {})
+            if not check_cfg.get("enabled", True):
+                logger.info(f"Check '{check.name}' disabilitato da config, skip")
+                continue
         try:
             alerts = check.run(data_obj, planning_rows, viaggi, planner, berlink)
             all_alerts.extend(alerts)

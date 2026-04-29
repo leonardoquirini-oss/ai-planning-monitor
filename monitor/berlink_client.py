@@ -5,12 +5,26 @@ logger = logging.getLogger("planning-monitor.berlink-client")
 
 
 class BERLinkClient:
-    """Client HTTP per BERLink API."""
+    """Client HTTP per BERLink Connector (DB) e BERLink API (notifiche)."""
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout: float = 60.0,
+        notifications_base_url: str | None = None,
+        notifications_api_key: str | None = None,
+        notifications_timeout: float | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        # URL separato per le notifiche (BERLink API :8090)
+        self.notifications_base_url = (
+            notifications_base_url.rstrip("/") if notifications_base_url else self.base_url
+        )
+        self.notifications_api_key = notifications_api_key or self.api_key
+        self.notifications_timeout = notifications_timeout or self.timeout
 
     def _headers(self):
         return {"X-API-Key": self.api_key, "Content-Type": "application/json"}
@@ -37,12 +51,17 @@ class BERLinkClient:
             resp.raise_for_status()
             return resp.json().get("data", [])
 
+    def _notifications_headers(self):
+        return {"X-API-Key": self.notifications_api_key, "Content-Type": "application/json"}
+
     def send_notification(self, notification: dict) -> dict:
-        """POST notifica a BERLink."""
-        with httpx.Client(timeout=self.timeout) as client:
+        """POST notifica a BERLink API (:8090)."""
+        url = f"{self.notifications_base_url}/api/notifications/send"
+        logger.info(f"POST {url} body: {notification}")
+        with httpx.Client(timeout=self.notifications_timeout) as client:
             resp = client.post(
-                f"{self.base_url}/api/notifications/send",
-                headers=self._headers(),
+                url,
+                headers=self._notifications_headers(),
                 json=notification,
             )
             resp.raise_for_status()
