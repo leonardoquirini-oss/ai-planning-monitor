@@ -363,7 +363,7 @@ Request:
   "notification_type": "planning_check",
   "title": "ETA fuori orario: BG 26A02612",
   "message": "L'autista Rossi Mario (targa XA 821 YL) per BG 26A02612 ha ETA alle 18:30, fuori dalla finestra di scarico (08:00-12:00, 15:00-16:30). Proposta: riassegnare a Bianchi Luigi che è a 45km dal carico.",
-  "username_receiver": "b.guido",
+  "group_code": "BG_DISCORDI",
   "entity_type": "trailer",
   "entity_id": "123",
   "link": "/planning?date=2026-04-27"
@@ -374,7 +374,7 @@ Campi:
 - `notification_type`: **obbligatorio** — usare sempre `"planning_check"`
 - `title`: **obbligatorio** — max 200 char
 - `message`: opzionale — testo dettagliato (output dell'LLM agent)
-- `username_receiver`: chi riceve (alternativa: `id_user_receiver` int o `email_receiver`)
+- `group_code`: broadcast a tutti i membri del gruppo (alternativa: `id_user_receiver`, `username_receiver`, `email_receiver`)
 - `link`: opzionale — URL relativo per navigazione UI BERLink
 - `entity_type`, `entity_id`: opzionali
 
@@ -696,7 +696,7 @@ def get_registered_checks() -> List[BaseCheck]:
 ### 8.4 Notifier (`monitor/notifier.py`)
 
 - Invio a BERLink via `BERLinkClient.send_notification()`
-- Body: `notification_type: "planning_check"`, `title`, `message`, `username_receiver`
+- Body: `notification_type: "planning_check"`, `title`, `message`, `group_code`
 - **Dedup in-memory**: dict `{dedup_key: last_sent_datetime}`, TTL configurabile (default 8h)
 - Un invio per ogni receiver in config
 - `cleanup_expired()` ogni ciclo
@@ -1076,7 +1076,7 @@ server:
 monitor:
   check_interval_seconds: 300       # 5 minuti (solo per comando daemon)
   notification_receivers:
-    - username_receiver: "b.guido"  # Pianificatore
+    - group_code: "BG_DISCORDI"    # Broadcast al gruppo
   dedup_ttl_hours: 8                # Non ri-notificare stessa anomalia entro 8h (solo daemon)
   checks:
     eta_orari:

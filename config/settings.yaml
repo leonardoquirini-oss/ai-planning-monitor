@@ -32,7 +32,7 @@ server:
 monitor:
   check_interval_seconds: 300
   notification_receivers:
-    - username_receiver: "leonardo.q"
+    - group_code: "BG_DISCORDI"
   dedup_ttl_hours: 8
   checks:
     eta_orari:
