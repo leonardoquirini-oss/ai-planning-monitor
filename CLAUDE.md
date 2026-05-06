@@ -90,7 +90,7 @@ Installate nel venv `.venv/`. Nessuna dipendenza pesante: il monitor e un thin c
 Tool usati dal monitor (whitelist sola lettura):
 `localizza_entita`, `calcola_eta_autista`, `get_eta_per_autista`, `check_orari_sede`,
 `trova_autista_piu_vicino`, `get_autisti_disponibili`, `get_pianificazione_corrente`,
-`calcola_distanza`, `calcola_etoa`, `cerca_bg_da_targa`
+`calcola_distanza`, `calcola_etoa`, `cerca_bg_da_targa`, `get_info_bg`
 
 ### BERLink (porta 9095)
 - `POST /api/Query/execute` — query SQL (planning giornaliero). Header: `X-API-Key`
