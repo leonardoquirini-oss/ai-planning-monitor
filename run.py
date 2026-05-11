@@ -39,13 +39,17 @@ def check(
     checks: Optional[str] = typer.Option(
         None, "--checks", "-c", help="Check specifici (comma-separated)"
     ),
+    bg: Optional[str] = typer.Option(
+        None, "--bg", "-b", help="Filtra per codici BG (comma-separated)"
+    ),
 ):
     """Esegue un ciclo di check sulla pianificazione (one-shot, modalità standard)."""
     from monitor.engine import run_check
 
     checks_list = checks.split(",") if checks else None
+    bg_list = bg.split(",") if bg else None
     result = run_check(
-        data=data, notify=notify, use_llm=not no_llm, checks=checks_list
+        data=data, notify=notify, use_llm=not no_llm, checks=checks_list, bg=bg_list
     )
 
     print_json(json.dumps(result, ensure_ascii=False, indent=2))
@@ -79,15 +83,52 @@ def daemon(
     notify: bool = typer.Option(True, "--notify", "-n"),
     no_llm: bool = typer.Option(False, "--no-llm"),
 ):
-    """Loop continuo (alternativa a cron + endpoint HTTP)."""
+    """Loop continuo con server HTTP embedded per invocazione remota."""
     import signal
+    import threading
     import time
 
+    import uvicorn
+
+    from monitor.berlink_client import BERLinkClient
     from monitor.engine import load_config, run_check
+    from monitor.notifier import MonitorNotifier
 
     config = load_config()
     if interval is None:
         interval = config.get("monitor", {}).get("check_interval_seconds", 300)
+
+    # Avvia server HTTP in background thread per invocazione remota
+    server_cfg = config.get("server", {})
+    http_host = server_cfg.get("host", "0.0.0.0")
+    http_port = server_cfg.get("port", 8610)
+
+    def _start_http_server():
+        uvi_config = uvicorn.Config(
+            "server:app", host=http_host, port=http_port, log_level="warning"
+        )
+        server = uvicorn.Server(uvi_config)
+        server.run()
+
+    http_thread = threading.Thread(target=_start_http_server, daemon=True)
+    http_thread.start()
+
+    # Notifier persistente: il dedup sopravvive tra i cicli
+    notif_raw = config.get("berlink_notifications", [])
+    notif_list = notif_raw if isinstance(notif_raw, list) else [notif_raw]
+    notif_clients = []
+    for notif_cfg in notif_list:
+        notif_clients.append(
+            BERLinkClient(
+                config["berlink"]["base_url"],
+                config["berlink"]["api_key"],
+                timeout=config["berlink"].get("timeout", 60.0),
+                notifications_base_url=notif_cfg.get("base_url"),
+                notifications_api_key=notif_cfg.get("api_key"),
+                notifications_timeout=notif_cfg.get("timeout"),
+            )
+        )
+    notifier = MonitorNotifier(notif_clients, config["monitor"])
 
     running = True
 
@@ -99,11 +140,12 @@ def daemon(
     signal.signal(signal.SIGTERM, _stop)
 
     console.print(
-        f"[bold blue]Planning Monitor Daemon[/bold blue] — ogni {interval}s"
+        f"[bold blue]Planning Monitor Daemon[/bold blue] — ogni {interval}s, "
+        f"HTTP :{http_port}"
     )
     while running:
         try:
-            result = run_check(notify=notify, use_llm=not no_llm)
+            result = run_check(notify=notify, use_llm=not no_llm, notifier=notifier)
             n = result.get("anomalie_trovate", 0)
             console.print(f"[dim]{result['data']}[/dim] — {n} anomalie")
         except Exception as e:

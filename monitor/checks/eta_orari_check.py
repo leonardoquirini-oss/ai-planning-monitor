@@ -1,9 +1,12 @@
 import logging
+import re
 from datetime import datetime
 from typing import List
 
 from models import CheckAlert
 from monitor.registry import BaseCheck, register_check
+
+BG_REGEX = re.compile(r"#(\d{2}[A-Z]\d+[_\d]*)")
 
 logger = logging.getLogger("planning-monitor.checks.eta_orari")
 
@@ -20,6 +23,17 @@ def _normalize_date(date_str: str) -> str:
     return date_str
 
 
+def _format_dt_it(iso_str: str) -> str:
+    """Formatta ISO datetime (2026-05-08T10:30:00) -> italiano (08/05/2026 10:30)."""
+    if not iso_str:
+        return iso_str
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except (ValueError, TypeError):
+        return iso_str
+
+
 def _get_viaggio_field(viaggio: dict, *keys: str, default: str = "") -> str:
     """Cerca il primo campo presente tra i nomi alternativi."""
     for k in keys:
@@ -34,7 +48,7 @@ class ETAOrariCheck(BaseCheck):
 
     name = "eta_orari"
 
-    def run(self, data, planning_rows, viaggi, planner_client, berlink_client):
+    def run(self, data, planning_rows, viaggi, planner_client, berlink_client, bg_filter=None):
         alerts: List[CheckAlert] = []
         data_str = data.isoformat()
 
@@ -46,56 +60,22 @@ class ETAOrariCheck(BaseCheck):
             if bg:
                 viaggi_by_bg[bg.upper()] = v
 
-        # Set per evitare chiamate duplicate sullo stesso autista
-        autisti_processati = set()
+        # Fast path: BG specifici → get_info_bg diretto, senza iterare tutti gli autisti
+        if bg_filter:
+            entries = self._resolve_bg_entries(bg_filter, planning_rows, planner_client, data_str)
+        else:
+            entries = self._resolve_all_entries(planning_rows, planner_client, data_str)
 
-        for row in planning_rows:
-            if not row.get("id_employee"):
-                continue
+        for entry in entries:
+            bg = entry["bg"]
+            driver = entry["driver"]
+            plate = entry["plate"]
+            eta_result = entry["eta_result"]
 
-            plate = row.get("plate_number", "")
-            driver = f"{row.get('driver_name', '')} {row.get('driver_surname', '')}".strip()
-            if not driver or driver in autisti_processati:
-                continue
-            autisti_processati.add(driver)
-
-            logger.info(f"[{plate}] {driver}")
-
-            try:
-                # Una sola chiamata: il tool trova il BG in corso da solo
-                eta_args = {"nome_autista": driver, "data": data_str}
-                logger.info(f"  -> execute get_eta_per_autista({eta_args})")
-                eta_result = planner_client.execute_tool(
-                    "get_eta_per_autista", eta_args,
-                )
-            except Exception as e:
-                logger.warning(f"  ETA fallita per {driver}: {e}")
-                continue
-
-            bg = eta_result.get("bg_in_corso", "")
             eta_str = eta_result.get("eta")
             etoa_str = eta_result.get("etoa")
             etoa_detail = eta_result.get("etoa_dettagli", "")
-
-            if not bg or not eta_str:
-                logger.info(f"  {driver}: nessun BG in corso o ETA non disponibile, skip")
-                continue
-
-            # Verifica se la missione è ancora aperta
-            try:
-                bg_info = planner_client.execute_tool("get_info_bg", {"codice": bg})
-                logger.debug(f"  get_info_bg({bg}): missione={bg_info.get('missione')}")
-                missione = bg_info.get("missione", {})
-                if not missione.get("aperta", True):
-                    logger.info(f"  BG {bg}: missione chiusa (status={missione.get('status')}), skip")
-                    continue
-            except Exception as e:
-                logger.warning(f"  get_info_bg fallito per {bg}: {e}")
-
-            logger.info(
-                f"  BG in corso: {bg}, ETA: {eta_result.get('eta_orario')}, "
-                f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
-            )
+            eta_orario = eta_result.get("eta_orario", eta_str)
 
             # Recupera data_scarico dal viaggio TIR
             viaggio = viaggi_by_bg.get(bg.upper(), {})
@@ -112,7 +92,6 @@ class ETAOrariCheck(BaseCheck):
                         "cerca_stato_ordine", {"codice": bg},
                     )
                     raw_consegna = _normalize_date(stato.get("data_consegna", ""))
-                    # Scarta date placeholder (es. 1900-01-01)
                     if raw_consegna and raw_consegna > "2000-01-01":
                         data_scarico = raw_consegna
                     luogo_carico = luogo_carico or stato.get("luogo_carico", "")
@@ -120,23 +99,21 @@ class ETAOrariCheck(BaseCheck):
                 except Exception as e:
                     logger.warning(f"  cerca_stato_ordine fallito per {bg}: {e}")
 
-            # Data di riferimento: data_scarico del viaggio, fallback a data del check
             ref_date = data_scarico or data_str
-
-            # Estrai data YYYY-MM-DD dall'ETOA ISO
             etoa_date_str = etoa_str[:10] if etoa_str and len(etoa_str) >= 10 else data_str
 
             # CRITICAL: ETOA slitta oltre la data di scarico prevista
-            if etoa_date_str and etoa_date_str > ref_date:
+            # Solo se abbiamo data_scarico reale — senza, non possiamo valutare
+            if data_scarico and etoa_date_str and etoa_date_str > ref_date:
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
                         severity="critical",
                         title=f"ETA fuori orario: {bg}",
                         message=(
-                            f"Autista {driver} ({plate}) per BG {bg}: "
-                            f"ETA {eta_result.get('eta_orario', eta_str)}, "
-                            f"disponibilità spostata a {etoa_str}. {etoa_detail}"
+                            f"Autista **{driver}** ({plate}) per BG [{bg}]\n"
+                            f"ETA arrivo: {eta_orario}, disponibilità spostata a {_format_dt_it(etoa_str)}.\n"
+                            f"{etoa_detail}"
                         ),
                         context={
                             "bg": bg,
@@ -163,9 +140,9 @@ class ETAOrariCheck(BaseCheck):
                         severity="warning",
                         title=f"Arrivo fuori finestra: {bg}",
                         message=(
-                            f"Autista {driver} ({plate}) BG {bg}: "
-                            f"ETA {eta_result.get('eta_orario', eta_str)} "
-                            f"fuori finestra apertura. {etoa_detail}"
+                            f"Autista **{driver}** ({plate}) BG [{bg}]\n"
+                            f"ETA arrivo: {eta_orario}, fuori finestra apertura.\n"
+                            f"{etoa_detail}"
                         ),
                         context={
                             "bg": bg,
@@ -182,6 +159,119 @@ class ETAOrariCheck(BaseCheck):
                 )
 
         return alerts
+
+    def _resolve_bg_entries(self, bg_filter, planning_rows, planner_client, data_str):
+        """Fast path: filtra planning_rows per BG richiesti, poi calcola ETA solo per quelli."""
+        entries = []
+        bg_filter_upper = {b.upper() for b in bg_filter}
+        autisti_processati = set()
+
+        for row in planning_rows:
+            if not row.get("id_employee"):
+                continue
+
+            planning_text = row.get("planning") or ""
+            bg_codes = BG_REGEX.findall(planning_text)
+
+            # Controlla se almeno un BG della riga è nel filtro
+            matching_bgs = [bg for bg in bg_codes if bg.upper() in bg_filter_upper]
+            if not matching_bgs:
+                continue
+
+            plate = row.get("plate_number", "")
+            driver = f"{row.get('driver_name', '')} {row.get('driver_surname', '')}".strip()
+            if not driver or driver in autisti_processati:
+                continue
+            autisti_processati.add(driver)
+
+            logger.info(f"[BG filter] {driver} ({plate}) — BG: {matching_bgs}")
+
+            try:
+                eta_result = planner_client.execute_tool(
+                    "get_eta_per_autista", {"nome_autista": driver, "data": data_str},
+                )
+            except Exception as e:
+                logger.warning(f"  ETA fallita per {driver}: {e}")
+                continue
+
+            bg = eta_result.get("bg_in_corso", matching_bgs[0])
+            if not eta_result.get("eta"):
+                logger.info(f"  {driver}: ETA non disponibile, skip")
+                continue
+
+            # Verifica se la missione è ancora aperta
+            try:
+                bg_info = planner_client.execute_tool("get_info_bg", {"codice": bg})
+                missione = bg_info.get("missione", {})
+                if not missione.get("aperta", True):
+                    logger.info(f"  BG {bg}: missione chiusa (status={missione.get('status')}), skip")
+                    continue
+            except Exception as e:
+                logger.warning(f"  get_info_bg fallito per {bg}: {e}")
+
+            logger.info(
+                f"  ETA: {eta_result.get('eta_orario')}, "
+                f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
+            )
+            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
+        return entries
+
+    def _resolve_all_entries(self, planning_rows, planner_client, data_str):
+        """Path standard: itera tutti gli autisti dalle righe planning."""
+        entries = []
+        autisti_processati = set()
+
+        for row in planning_rows:
+            if not row.get("id_employee"):
+                continue
+
+            planning_text = row.get("planning") or ""
+            row_bgs = {bg.upper() for bg in BG_REGEX.findall(planning_text)}
+            if not row_bgs:
+                continue
+
+            plate = row.get("plate_number", "")
+            driver = f"{row.get('driver_name', '')} {row.get('driver_surname', '')}".strip()
+            if not driver or driver in autisti_processati:
+                continue
+            autisti_processati.add(driver)
+
+            logger.info(f"[{plate}] {driver} — BG planning: {row_bgs}")
+
+            try:
+                eta_args = {"nome_autista": driver, "data": data_str}
+                logger.info(f"  -> execute get_eta_per_autista({eta_args})")
+                eta_result = planner_client.execute_tool("get_eta_per_autista", eta_args)
+            except Exception as e:
+                logger.warning(f"  ETA fallita per {driver}: {e}")
+                continue
+
+            bg = eta_result.get("bg_in_corso", "")
+            if not bg or not eta_result.get("eta"):
+                logger.info(f"  {driver}: nessun BG in corso o ETA non disponibile, skip")
+                continue
+
+            # Verifica che il BG in corso sia tra quelli assegnati nel planning di oggi
+            if bg.upper() not in row_bgs:
+                logger.info(f"  {driver}: BG in corso {bg} non presente nel planning odierno ({row_bgs}), skip")
+                continue
+
+            # Verifica se la missione è ancora aperta
+            try:
+                bg_info = planner_client.execute_tool("get_info_bg", {"codice": bg})
+                missione = bg_info.get("missione", {})
+                if not missione.get("aperta", True):
+                    logger.info(f"  BG {bg}: missione chiusa (status={missione.get('status')}), skip")
+                    continue
+            except Exception as e:
+                logger.warning(f"  get_info_bg fallito per {bg}: {e}")
+
+            logger.info(
+                f"  BG in corso: {bg}, ETA: {eta_result.get('eta_orario')}, "
+                f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
+            )
+            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
+        return entries
 
 
 register_check(ETAOrariCheck())

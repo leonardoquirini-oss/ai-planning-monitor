@@ -1,0 +1,16 @@
+[Unit]
+Description=Planning Monitor Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=berni
+WorkingDirectory=/home/berni/planning-monitor
+ExecStart=/home/berni/planning-monitor/.venv/bin/python run.py daemon --interval 1800
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/berni/planning-monitor/logs/daemon.log
+StandardError=append:/home/berni/planning-monitor/logs/daemon.log
+
+[Install]
+WantedBy=multi-user.target

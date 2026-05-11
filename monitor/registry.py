@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from datetime import date
-from typing import List
+from typing import List, Optional
 
 from models import CheckAlert
 
@@ -16,6 +16,7 @@ class BaseCheck(ABC):
         viaggi: dict,
         planner_client,
         berlink_client,
+        bg_filter: Optional[List[str]] = None,
     ) -> List[CheckAlert]:
         """Esegue il check e ritorna lista alert."""
         ...

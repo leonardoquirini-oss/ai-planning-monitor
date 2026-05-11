@@ -46,6 +46,8 @@ def run_check(
     notify: bool = False,
     use_llm: bool = True,
     checks: Optional[List[str]] = None,
+    bg: Optional[List[str]] = None,
+    notifier: MonitorNotifier = None,
 ) -> dict:
     """
     Esegue un ciclo completo di check. Entry point one-shot.
@@ -64,15 +66,33 @@ def run_check(
         config["planner"]["base_url"],
         timeout=config["planner"].get("timeout", 120.0),
     )
-    notif_cfg = config.get("berlink_notifications", {})
+
+    # Costruisci lista destinazioni notifiche (backward compat: dict → list)
+    notif_raw = config.get("berlink_notifications", [])
+    notif_list = notif_raw if isinstance(notif_raw, list) else [notif_raw]
+
     berlink = BERLinkClient(
         config["berlink"]["base_url"],
         config["berlink"]["api_key"],
         timeout=config["berlink"].get("timeout", 60.0),
-        notifications_base_url=notif_cfg.get("base_url"),
-        notifications_api_key=notif_cfg.get("api_key"),
-        notifications_timeout=notif_cfg.get("timeout"),
+        notifications_base_url=notif_list[0].get("base_url") if notif_list else None,
+        notifications_api_key=notif_list[0].get("api_key") if notif_list else None,
+        notifications_timeout=notif_list[0].get("timeout") if notif_list else None,
     )
+
+    # Client BERLink per ogni destinazione notifiche
+    notif_clients = []
+    for notif_cfg in notif_list:
+        notif_clients.append(
+            BERLinkClient(
+                config["berlink"]["base_url"],
+                config["berlink"]["api_key"],
+                timeout=config["berlink"].get("timeout", 60.0),
+                notifications_base_url=notif_cfg.get("base_url"),
+                notifications_api_key=notif_cfg.get("api_key"),
+                notifications_timeout=notif_cfg.get("timeout"),
+            )
+        )
 
     data_obj = date.fromisoformat(data) if data else date.today()
     data_str = data_obj.isoformat()
@@ -102,7 +122,7 @@ def run_check(
                 logger.info(f"Check '{check.name}' disabilitato da config, skip")
                 continue
         try:
-            alerts = check.run(data_obj, planning_rows, viaggi, planner, berlink)
+            alerts = check.run(data_obj, planning_rows, viaggi, planner, berlink, bg_filter=bg)
             all_alerts.extend(alerts)
             checks_eseguiti += 1
             logger.info(f"Check '{check.name}': {len(alerts)} alert")
@@ -124,11 +144,12 @@ def run_check(
     # 4. Notifiche (opzionale)
     notifiche_inviate = 0
     if notify and all_alerts:
-        notifier = MonitorNotifier(berlink, config["monitor"])
-        notifiche_inviate = notifier.send_batch(all_alerts, llm_message=analisi_llm)
+        if notifier is None:
+            notifier = MonitorNotifier(notif_clients, config["monitor"])
+        notifiche_inviate = notifier.send_batch(all_alerts)
         logger.info(f"Notifiche inviate: {notifiche_inviate}")
 
-    return {
+    result = {
         "success": True,
         "data": data_str,
         "checks_eseguiti": checks_eseguiti,
@@ -148,3 +169,11 @@ def run_check(
         "analisi_llm": analisi_llm,
         "notifiche_inviate": notifiche_inviate,
     }
+
+    # 5. Invio report consolidato a tutte le destinazioni BERLink
+    if notify:
+        if notifier is None:
+            notifier = MonitorNotifier(notif_clients, config["monitor"])
+        notifier.send_report(result)
+
+    return result

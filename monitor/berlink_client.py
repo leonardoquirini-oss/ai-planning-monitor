@@ -66,3 +66,16 @@ class BERLinkClient:
             )
             resp.raise_for_status()
             return resp.json()
+
+    def send_monitor_report(self, report: dict) -> dict:
+        """POST report consolidato al tab Monitor di BERLink."""
+        url = f"{self.notifications_base_url}/api/notifications/monitor/planning"
+        logger.info(f"POST {url} (report data={report.get('data')})")
+        with httpx.Client(timeout=self.notifications_timeout) as client:
+            resp = client.post(
+                url,
+                headers=self._notifications_headers(),
+                json=report,
+            )
+            resp.raise_for_status()
+            return resp.json()

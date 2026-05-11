@@ -23,6 +23,7 @@ Uso: ./run.sh <comando> [opzioni]
 
 Comandi:
   check [DATA]         Check one-shot (default: oggi)
+  check-bg BG [DATA]   Check filtrato per codice BG + notifica
   check-nollm [DATA]   Check solo deterministici, senza LLM
   check-notify [DATA]  Check + invio notifiche BERLink
   serve [PORTA]        Avvia server HTTP (default: 8610)
@@ -33,6 +34,7 @@ Comandi:
 Esempi:
   ./run.sh check                  # Check oggi con LLM
   ./run.sh check 2026-04-28      # Check data specifica
+  ./run.sh check-bg 26A02906      # Check singolo BG + notifica
   ./run.sh check-notify           # Check + notifiche BERLink
   ./run.sh check-nollm            # Solo check deterministici
   ./run.sh serve                  # Server su :8610
@@ -46,6 +48,12 @@ EOF
 
 cmd_check() {
     "$PYTHON" "$SCRIPT_DIR/run.py" check "$@"
+}
+
+cmd_check_bg() {
+    local bg="${1:?Errore: specifica il codice BG}"
+    shift
+    "$PYTHON" "$SCRIPT_DIR/run.py" check --bg "$bg" --notify --no-llm "$@"
 }
 
 cmd_check_nollm() {
@@ -80,8 +88,10 @@ cmd_status() {
     fi
 
     echo "=== BERLink (:9095) ==="
-    if curl -sf --max-time 5 "http://192.168.0.12:9095" > /dev/null 2>&1; then
-        echo "  OK"
+    local http_code
+    http_code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://192.168.0.12:9095" 2>/dev/null || echo "000")
+    if [ "$http_code" != "000" ]; then
+        echo "  OK (HTTP $http_code)"
     else
         echo "  NON RAGGIUNGIBILE"
     fi
@@ -98,6 +108,7 @@ cmd_status() {
 
 case "${1:-}" in
     check)        shift; cmd_check "$@" ;;
+    check-bg)     shift; cmd_check_bg "$@" ;;
     check-nollm)  shift; cmd_check_nollm "$@" ;;
     check-notify) shift; cmd_check_notify "$@" ;;
     serve)        shift; cmd_serve "$@" ;;

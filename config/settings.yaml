@@ -9,17 +9,24 @@ berlink:
   api_key: "0e223634-4c2a-44f2-8139-960f03964933"
   timeout: 60.0
 
-# BERLink API (notifiche)
+# BERLink API (notifiche) — lista di destinazioni, notifiche inviate a ciascuna
 berlink_notifications:
-  base_url: "http://192.168.0.12:8090"
-  api_key: "jpm7YIedQgwcu44WpJirqt3x4Y7dcmdcaZ7tMIsa6x4"
-  timeout: 60.0
+  - name: "produzione"
+    base_url: "http://192.168.0.12:8090"
+    api_key: "jpm7YIedQgwcu44WpJirqt3x4Y7dcmdcaZ7tMIsa6x4"
+    timeout: 60.0
+  - name: "leo"
+    base_url: "http://192.168.0.39:8090"
+    api_key: "7GQ70mC0jghbDaUDWh_xTVU6bpK0zeE4yl8OHCXQegk"
+    timeout: 60.0
+
 
 # LLM (OpenRouter)
 llm:
   provider: "openrouter"
   base_url: "https://openrouter.ai/api/v1"
-  model: "anthropic/claude-3-5-haiku"
+  model: "deepseek/deepseek-v4-flash"
+  #model: "anthropic/claude-3-5-haiku"
   temperature: 0.1
   max_tokens: 2000
 
@@ -31,9 +38,15 @@ server:
 # Monitor
 monitor:
   check_interval_seconds: 300
-  notification_receivers:
-    - group_code: "BG_DISCORDI"
   dedup_ttl_hours: 8
   checks:
     eta_orari:
       enabled: true
+      notification_receivers:
+        - group_code: "AI_PLANNING_CHECK"
+
+
+
+#  sudo cp planning-monitor.service /etc/systemd/system/
+#  sudo systemctl daemon-reload
+#  sudo systemctl enable --now planning-monitor.service

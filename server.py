@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Optional
 
 from fastapi import FastAPI
@@ -14,11 +15,13 @@ MONITOR_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "agent_check",
+            "name": "esegui_check_monitoraggio",
             "description": (
                 "Esegue i check di monitoraggio sulla pianificazione del giorno. "
-                "Verifica ETA vs orari sede, anomalie, e opzionalmente analizza con LLM "
-                "e invia notifiche BERLink."
+                "Verifica ETA vs orari apertura sede, anomalie nella pianificazione, "
+                "e analizza i problemi trovati. Usa questo tool quando l'utente chiede "
+                "di controllare, verificare o monitorare la pianificazione, "
+                "o di cercare anomalie nei viaggi del giorno."
             ),
             "parameters": {
                 "type": "object",
@@ -34,13 +37,18 @@ MONITOR_TOOLS_SCHEMA = [
                     },
                     "use_llm": {
                         "type": "boolean",
-                        "description": "Se true, usa LLM per analisi",
+                        "description": "Se true, usa LLM per analisi approfondita",
                         "default": True,
                     },
                     "checks": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Lista check specifici da eseguire (default: tutti)",
+                    },
+                    "bg": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filtra per codici BG specifici (default: tutti)",
                     },
                 },
                 "required": [],
@@ -50,7 +58,8 @@ MONITOR_TOOLS_SCHEMA = [
 ]
 
 MONITOR_TOOLS_FUNCTIONS = {
-    "agent_check": run_check,
+    "esegui_check_monitoraggio": run_check,
+    "agent_check": run_check,  # backward compatibility
 }
 
 
@@ -74,7 +83,8 @@ async def execute_tool(request: dict):
             "error": f"Tool '{tool_name}' non trovato",
             "available": list(MONITOR_TOOLS_FUNCTIONS.keys()),
         }
-    return func(**args)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: func(**args))
 
 
 # --- Endpoint dedicati ---
@@ -85,13 +95,19 @@ class CheckRequest(BaseModel):
     notify: bool = False
     use_llm: bool = True
     checks: Optional[List[str]] = None
+    bg: Optional[List[str]] = None
 
 
 @app.post("/api/monitor/check")
 async def api_check(req: CheckRequest):
     """Esegue un ciclo completo di check (endpoint diretto)."""
-    return run_check(
-        data=req.data, notify=req.notify, use_llm=req.use_llm, checks=req.checks
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: run_check(
+            data=req.data, notify=req.notify, use_llm=req.use_llm,
+            checks=req.checks, bg=req.bg,
+        ),
     )
 
 
