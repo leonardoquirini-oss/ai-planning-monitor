@@ -36,20 +36,25 @@ Ogni check ritorna una lista di `CheckAlert` (definito in `models/__init__.py`).
 ```json
 {
   "check": "eta_orari",
-  "severity": "critical",
-  "title": "ETA fuori orario: 26A02612",
-  "message": "Autista Rossi Mario (XA 821 YL) per BG 26A02612: ETA 18:30, disponibilita spostata a 2026-04-29T08:00:00. ETA 18:30 fuori finestra pomeriggio 15:00-16:30 -> prossima apertura domani 08:00.",
+  "severity": "warning",
+  "title": "Ritardo GPS: 26A02912_01",
+  "message": "Autista **Franco Candia** (XA 821 YL) per BG [26A02912_01] — Fiorenzuola d'Arda\nETA teorico: 12:00, **ETA GPS: 12/05 14:36** (+156 min).\nGPS rileva ritardo: 369 km dalla destinazione, arrivo stimato GPS 14:36 vs ETA teorico 12:00 (+156 min)",
   "entity_type": "trailer",
   "entity_id": "XA 821 YL",
   "context": {
-    "bg": "26A02612",
+    "bg": "26A02912_01",
     "targa": "XA 821 YL",
-    "eta": "2026-04-28T18:30:00",
-    "etoa": "2026-04-29T08:00:00",
-    "autista": "Rossi Mario",
-    "data": "2026-04-28",
-    "luogo_scarico": "Milano",
-    "luogo_carico": "Terni"
+    "eta": "2026-05-12T12:00:00",
+    "eta_aggiornato": "2026-05-12T14:36:00",
+    "etoa": "2026-05-12T14:00:00",
+    "disponibile_da": "2026-05-12T14:00:00",
+    "verifica_gps": "ritardo",
+    "ritardo_minuti": 156,
+    "autista": "Franco Candia",
+    "data": "2026-05-12",
+    "data_scarico": "2026-05-12",
+    "luogo_scarico": "Fiorenzuola d'Arda",
+    "luogo_carico": ""
   }
 }
 ```
@@ -115,75 +120,65 @@ Cattura il gruppo dopo `#`. Esempi:
 
 Cerca il BG (uppercased) in `viaggi_by_bg`. Se non c'e corrispondenza il BG viene saltato — non e un viaggio noto nel sistema.
 
-**Step 5 — Calcolo ETA** (chiamata HTTP al Planning Agent)
+**Step 5 — Calcolo ETA + ETOA + verifica GPS** (singola chiamata HTTP al Planning Agent)
 
 ```
 POST /api/planning/execute
 {
-  "tool": "calcola_eta_autista",
+  "tool": "get_eta_per_autista",
   "args": {
-    "bg": "26A02612",
-    "targa": "XA 821 YL",
-    "luogo_scarico": "Milano",
-    "data_scarico": "2026-04-28"
+    "nome_autista": "Franco Candia",
+    "data": "2026-05-12"
   }
 }
 ```
 
-Il Planning Agent applica la sua cascata interna per determinare l'ETA:
-1. Missione TFP (se gia presente con ETA)
-2. Evento GPS (arrivo/partenza recente)
-3. GPS live + routing stradale (posizione attuale -> destinazione)
-4. Fallback DataS (stima dal sistema legacy)
+Il tool `get_eta_per_autista` restituisce in un'unica risposta:
+
+- **ETA teorico** (`eta`, `eta_orario`): da missione TFP, evento GPS, routing, o fallback DataS
+- **ETOA** (`etoa`, `etoa_orario`): ETA combinato con orari apertura sede
+- **Disponibilità** (`disponibile_da`): quando l'autista sarà effettivamente disponibile
+- **Verifica GPS** (`verifica_gps`, `eta_aggiornato`, `ritardo_minuti`, `verifica_dettagli`): validazione ETA teorico vs posizione GPS reale
+  - `verifica_gps`: `"confermato"` | `"ritardo"` | `"non_disponibile"` | `"non_applicabile"`
+  - Se `"ritardo"`: `eta_aggiornato` contiene l'ETA ricalcolato da GPS con delta in `ritardo_minuti`
 
 Se il tool non restituisce `eta`, il BG viene saltato (dati insufficienti).
 
-**Step 6 — Calcolo ETOA** (chiamata HTTP al Planning Agent)
-
-```
-POST /api/planning/execute
-{
-  "tool": "calcola_etoa",
-  "args": {
-    "eta": "2026-04-28T14:30:00",
-    "bg": "26A02612",
-    "data": "2026-04-28"
-  }
-}
-```
-
-Il tool `calcola_etoa` combina l'ETA con gli orari di apertura della sede di scarico:
-- Se ETA dentro finestra aperta -> ETOA = ETA + durata operazione
-- Se ETA in pausa pranzo (es. 12:00-15:00) -> ETOA slitta alla riapertura pomeridiana
-- Se ETA dopo chiusura serale -> ETOA slitta al giorno lavorativo successivo
-- Salta weekend e festivita se configurati
-
-Ritorna `etoa` (datetime), `etoa_data` (solo data), `dettagli` (spiegazione testuale).
-
 **Step 7 — Valutazione alert**
 
-| Condizione                               | Severity     | Titolo                           | Significato                                      |
-|------------------------------------------|--------------|----------------------------------|--------------------------------------------------|
-| `etoa_data > data` (giorno successivo)   | **critical** | `ETA fuori orario: {bg}`        | L'operazione non si completa oggi. Scarico rimandato a domani o oltre. |
-| `etoa > eta` (stesso giorno)             | **warning**  | `Arrivo fuori finestra: {bg}`   | L'autista arriva fuori finestra apertura, ma si recupera in giornata (es. dopo pausa pranzo). |
-| Nessuna delle due                        | —            | —                                | Nessun problema: ETA dentro finestra, operazione regolare. |
+Tre scenari in ordine di priorità (mutuamente esclusivi per BG+targa):
+
+| Priorità | Condizione                                          | Severity    | Titolo                           | Significato                                      |
+|----------|-----------------------------------------------------|-------------|----------------------------------|--------------------------------------------------|
+| A        | `verifica_gps == "ritardo"` e `eta_aggiornato` presente | **warning** | `Ritardo GPS: {bg}`             | GPS rileva ritardo rispetto a ETA teorico. Alert sempre, anche se rientra in orario. |
+| B        | `disponibile_da > data_scarico` (fine giornata)     | **warning** | `ETA fuori orario: {bg}`        | Disponibilità slitta oltre la data di consegna prevista. |
+| C        | `etoa > eta_effettivo` stesso giorno                | **warning** | `Arrivo fuori finestra: {bg}`   | Arrivo fuori finestra apertura sede, ma si recupera in giornata. |
+| —        | Nessuna delle precedenti                            | —           | —                                | Nessun problema rilevato. |
+
+**Note**:
+- Lo scenario A scatta SEMPRE quando GPS rileva ritardo, indipendentemente dalla gravità
+- L'ETA effettivo usa `eta_aggiornato` (GPS) quando disponibile, altrimenti `eta` (teorico)
+- Tutti i confronti usano datetime completi (non solo date)
 
 #### Campi `context` prodotti
 
-Il dizionario `context` dell'alert contiene i dati strutturati che il Monitor LLM Agent usa per approfondire l'analisi e proporre soluzioni:
+Il dizionario `context` dell'alert è unificato per tutti gli scenari e contiene i dati strutturati che il Monitor LLM Agent usa per approfondire l'analisi:
 
-| Campo           | Tipo   | Presente in        | Descrizione                                |
-|-----------------|--------|--------------------|--------------------------------------------|
-| `bg`            | `str`  | critical, warning  | Codice BG del viaggio                      |
-| `targa`         | `str`  | critical, warning  | Targa semirimorchio                        |
-| `eta`           | `str`  | critical, warning  | ETA calcolata (datetime ISO)               |
-| `etoa`          | `str`  | critical, warning  | ETOA calcolata (datetime ISO)              |
-| `autista`       | `str`  | critical, warning  | Nome completo autista                      |
-| `data`          | `str`  | critical, warning  | Data di riferimento (YYYY-MM-DD)           |
-| `luogo_scarico` | `str`  | critical           | Localita di scarico                        |
-| `luogo_carico`  | `str`  | critical           | Localita di carico                         |
-
-Nota: gli alert `warning` non includono `luogo_scarico` e `luogo_carico` nel context perche il problema e meno grave e non richiede analisi di autisti alternativi.
+| Campo              | Tipo        | Descrizione                                          |
+|--------------------|-------------|------------------------------------------------------|
+| `bg`               | `str`       | Codice BG del viaggio                                |
+| `targa`            | `str`       | Targa semirimorchio                                  |
+| `eta`              | `str`       | ETA teorico (datetime ISO)                           |
+| `eta_aggiornato`   | `str/None`  | ETA ricalcolato da GPS (datetime ISO)                |
+| `etoa`             | `str`       | ETOA con orari sede (datetime ISO)                   |
+| `disponibile_da`   | `str`       | Quando l'autista sarà effettivamente disponibile     |
+| `verifica_gps`     | `str`       | Stato verifica GPS: confermato/ritardo/non_disponibile/non_applicabile |
+| `ritardo_minuti`   | `int`       | Delta in minuti tra ETA GPS e ETA teorico            |
+| `autista`          | `str`       | Nome completo autista                                |
+| `data`             | `str`       | Data di riferimento (YYYY-MM-DD)                     |
+| `data_scarico`     | `str`       | Data consegna prevista (YYYY-MM-DD)                  |
+| `luogo_scarico`    | `str`       | Località di scarico                                  |
+| `luogo_carico`     | `str`       | Località di carico                                   |
 
 #### Dedup key
 
@@ -195,10 +190,10 @@ Impedisce che la stessa anomalia generi notifiche ripetute entro il TTL configur
 
 #### Chiamate HTTP per iterazione
 
-Per ogni BG con viaggio associato, il check effettua **2 chiamate** al Planning Agent:
+Per ogni autista con BG valido, il check effettua **2 chiamate** al Planning Agent:
 
-1. `calcola_eta_autista` — ETA di arrivo
-2. `calcola_etoa` — ETOA considerando orari sede
+1. `get_eta_per_autista` — ETA + ETOA + verifica GPS (tutto in una chiamata)
+2. `get_info_bg` — verifica se la missione è ancora aperta
 
 Il numero totale di chiamate dipende dal numero di righe planning con autista e BG valido.
 

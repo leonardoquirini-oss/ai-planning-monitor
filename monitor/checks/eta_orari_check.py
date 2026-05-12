@@ -43,6 +43,28 @@ def _get_viaggio_field(viaggio: dict, *keys: str, default: str = "") -> str:
     return default
 
 
+def _parse_iso(val: str):
+    """Parse ISO datetime, None on failure."""
+    if not val:
+        return None
+    try:
+        return datetime.fromisoformat(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _effective_eta(eta_result: dict):
+    """Restituisce (eta_iso, eta_display, is_gps_delayed) usando GPS se disponibile."""
+    verifica = eta_result.get("verifica_gps", "")
+    eta_agg = eta_result.get("eta_aggiornato", "")
+    eta_agg_display = eta_result.get("eta_aggiornato_data", "") or _format_dt_it(eta_agg)
+    if verifica == "ritardo" and eta_agg:
+        return eta_agg, eta_agg_display, True
+    eta = eta_result.get("eta", "")
+    eta_display = eta_result.get("eta_orario", "") or _format_dt_it(eta)
+    return eta, eta_display, False
+
+
 class ETAOrariCheck(BaseCheck):
     """Verifica ETA autista vs orari apertura sede carico/scarico."""
 
@@ -72,10 +94,31 @@ class ETAOrariCheck(BaseCheck):
             plate = entry["plate"]
             eta_result = entry["eta_result"]
 
+            # Campi base
             eta_str = eta_result.get("eta")
             etoa_str = eta_result.get("etoa")
             etoa_detail = eta_result.get("etoa_dettagli", "")
-            eta_orario = eta_result.get("eta_orario", eta_str)
+
+            # GPS validation
+            verifica_gps = eta_result.get("verifica_gps", "")
+            ritardo_minuti = eta_result.get("ritardo_minuti", 0)
+            verifica_dettagli = eta_result.get("verifica_dettagli", "")
+
+            # Fallback: calcola ritardo_minuti da eta_aggiornato - eta se mancante
+            if verifica_gps == "ritardo" and not ritardo_minuti:
+                eta_dt = _parse_iso(eta_str)
+                eta_agg_dt = _parse_iso(eta_result.get("eta_aggiornato", ""))
+                if eta_dt and eta_agg_dt:
+                    # Rimuovi timezone per confronto sicuro
+                    if eta_agg_dt.tzinfo and not eta_dt.tzinfo:
+                        eta_agg_dt = eta_agg_dt.replace(tzinfo=None)
+                    ritardo_minuti = int((eta_agg_dt - eta_dt).total_seconds() / 60)
+
+            # ETA effettivo (GPS-corrected se disponibile)
+            eff_eta_iso, eff_eta_display, is_gps_delayed = _effective_eta(eta_result)
+
+            # Disponibilità reale
+            disponibile_da_str = eta_result.get("disponibile_da", etoa_str)
 
             # Recupera data_scarico dal viaggio TIR
             viaggio = viaggi_by_bg.get(bg.upper(), {})
@@ -99,63 +142,112 @@ class ETAOrariCheck(BaseCheck):
                 except Exception as e:
                     logger.warning(f"  cerca_stato_ordine fallito per {bg}: {e}")
 
-            ref_date = data_scarico or data_str
-            etoa_date_str = etoa_str[:10] if etoa_str and len(etoa_str) >= 10 else data_str
+            # Parse datetime per confronti
+            etoa_dt = _parse_iso(etoa_str)
+            eff_eta_dt = _parse_iso(eff_eta_iso)
+            disponibile_da_dt = _parse_iso(disponibile_da_str)
+            scarico_deadline = _parse_iso(data_scarico + "T23:59:59") if data_scarico else None
 
-            # CRITICAL: ETOA slitta oltre la data di scarico prevista
-            # Solo se abbiamo data_scarico reale — senza, non possiamo valutare
-            if data_scarico and etoa_date_str and etoa_date_str > ref_date:
+            # Context comune per tutti gli scenari
+            alert_context = {
+                "bg": bg,
+                "targa": plate,
+                "eta": eta_str,
+                "eta_aggiornato": eta_result.get("eta_aggiornato"),
+                "etoa": etoa_str,
+                "disponibile_da": disponibile_da_str,
+                "verifica_gps": verifica_gps,
+                "ritardo_minuti": ritardo_minuti,
+                "autista": driver,
+                "data": data_str,
+                "data_scarico": data_scarico or "",
+                "luogo_scarico": luogo_scarico,
+                "luogo_carico": luogo_carico,
+            }
+
+            eta_teorico_display = eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
+            alert_fired = False
+
+            # Scenario A: GPS rileva ritardo — alert SEMPRE
+            if is_gps_delayed:
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
-                        severity="critical",
-                        title=f"ETA fuori orario: {bg}",
+                        severity="warning",
+                        title=f"Ritardo GPS: {bg}",
                         message=(
-                            f"Autista **{driver}** ({plate}) per BG [{bg}]\n"
-                            f"ETA arrivo: {eta_orario}, disponibilità spostata a {_format_dt_it(etoa_str)}.\n"
-                            f"{etoa_detail}"
+                            f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
+                            f"ETA teorico: {eta_teorico_display}, "
+                            f"**ETA GPS: {eff_eta_display}** (+{ritardo_minuti} min).\n"
+                            f"{verifica_dettagli}"
                         ),
-                        context={
-                            "bg": bg,
-                            "targa": plate,
-                            "eta": eta_str,
-                            "etoa": etoa_str,
-                            "autista": driver,
-                            "data": data_str,
-                            "data_scarico": ref_date,
-                            "luogo_scarico": luogo_scarico,
-                            "luogo_carico": luogo_carico,
-                        },
+                        context=alert_context,
                         entity_type="trailer",
                         entity_id=plate,
                         dedup_key=f"eta_orari:{bg}:{plate}",
                     )
                 )
+                alert_fired = True
 
-            # WARNING: arrivo fuori finestra stesso giorno (sede chiusa)
-            elif etoa_str and eta_str and etoa_str > eta_str and "sede chiusa" in etoa_detail:
+            # Scenario B: disponibilità slitta oltre data_scarico (next-day)
+            if (
+                not alert_fired
+                and scarico_deadline
+                and disponibile_da_dt
+                and disponibile_da_dt > scarico_deadline
+            ):
+                alerts.append(
+                    CheckAlert(
+                        check_name=self.name,
+                        severity="warning",
+                        title=f"ETA fuori orario: {bg}",
+                        message=(
+                            f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
+                            f"ETA: {eta_teorico_display}, "
+                            f"disponibilità spostata a **{_format_dt_it(disponibile_da_str)}**.\n"
+                            f"Consegna prevista entro: {data_scarico}.\n"
+                            f"{etoa_detail}"
+                        ),
+                        context=alert_context,
+                        entity_type="trailer",
+                        entity_id=plate,
+                        dedup_key=f"eta_orari:{bg}:{plate}",
+                    )
+                )
+                alert_fired = True
+
+            # Scenario C: stesso giorno, fuori finestra apertura
+            if (
+                not alert_fired
+                and etoa_dt
+                and eff_eta_dt
+                and etoa_dt > eff_eta_dt
+                and etoa_dt.date() == eff_eta_dt.date()
+            ):
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
                         severity="warning",
                         title=f"Arrivo fuori finestra: {bg}",
                         message=(
-                            f"Autista **{driver}** ({plate}) BG [{bg}]\n"
-                            f"ETA arrivo: {eta_orario}, fuori finestra apertura.\n"
+                            f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
+                            f"ETA arrivo: {_format_dt_it(eff_eta_iso)}, "
+                            f"fuori finestra apertura.\n"
+                            f"Disponibile da: **{_format_dt_it(etoa_str)}**.\n"
                             f"{etoa_detail}"
                         ),
-                        context={
-                            "bg": bg,
-                            "targa": plate,
-                            "eta": eta_str,
-                            "etoa": etoa_str,
-                            "autista": driver,
-                            "data": data_str,
-                        },
+                        context=alert_context,
                         entity_type="trailer",
                         entity_id=plate,
                         dedup_key=f"eta_orari:{bg}:{plate}",
                     )
+                )
+                alert_fired = True
+
+            if not alert_fired:
+                logger.debug(
+                    f"  {bg}: nessun alert — eff_eta={eff_eta_iso}, "
+                    f"etoa={etoa_str}, scarico={data_scarico}, gps={verifica_gps}"
                 )
 
         return alerts
@@ -213,6 +305,7 @@ class ETAOrariCheck(BaseCheck):
                 f"  ETA: {eta_result.get('eta_orario')}, "
                 f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
             )
+            logger.debug(f"  get_eta_per_autista response: {eta_result}")
             entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
         return entries
 
@@ -270,6 +363,7 @@ class ETAOrariCheck(BaseCheck):
                 f"  BG in corso: {bg}, ETA: {eta_result.get('eta_orario')}, "
                 f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
             )
+            logger.debug(f"  get_eta_per_autista response: {eta_result}")
             entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
         return entries
 
