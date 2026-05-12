@@ -44,11 +44,12 @@ def _get_viaggio_field(viaggio: dict, *keys: str, default: str = "") -> str:
 
 
 def _parse_iso(val: str):
-    """Parse ISO datetime, None on failure."""
+    """Parse ISO datetime, None on failure. Sempre naive (strip tzinfo)."""
     if not val:
         return None
     try:
-        return datetime.fromisoformat(val)
+        dt = datetime.fromisoformat(val)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
     except (ValueError, TypeError):
         return None
 
@@ -89,6 +90,7 @@ class ETAOrariCheck(BaseCheck):
             entries = self._resolve_all_entries(planning_rows, planner_client, data_str)
 
         for entry in entries:
+          try:
             bg = entry["bg"]
             driver = entry["driver"]
             plate = entry["plate"]
@@ -142,6 +144,11 @@ class ETAOrariCheck(BaseCheck):
                 except Exception as e:
                     logger.warning(f"  cerca_stato_ordine fallito per {bg}: {e}")
 
+            # Skip viaggi con scarico in data futura rispetto al giorno di check
+            if data_scarico and data_scarico > data_str:
+                logger.info(f"  {bg}: data_scarico={data_scarico} > check={data_str}, skip (futuro)")
+                continue
+
             # Parse datetime per confronti
             etoa_dt = _parse_iso(etoa_str)
             eff_eta_dt = _parse_iso(eff_eta_iso)
@@ -166,6 +173,7 @@ class ETAOrariCheck(BaseCheck):
             }
 
             eta_teorico_display = eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
+            has_gps = verifica_gps in ("ritardo", "confermato")
             alert_fired = False
 
             # Scenario A: GPS rileva ritardo — alert SEMPRE
@@ -199,7 +207,7 @@ class ETAOrariCheck(BaseCheck):
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
-                        severity="warning",
+                        severity="warning" if has_gps else "info",
                         title=f"ETA fuori orario: {bg}",
                         message=(
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
@@ -217,17 +225,19 @@ class ETAOrariCheck(BaseCheck):
                 alert_fired = True
 
             # Scenario C: stesso giorno, fuori finestra apertura
+            # Se disponibile_da == etoa, il gap ETA→ETOA è solo tempo operazione, non finestra
             if (
                 not alert_fired
                 and etoa_dt
                 and eff_eta_dt
-                and etoa_dt > eff_eta_dt
-                and etoa_dt.date() == eff_eta_dt.date()
+                and disponibile_da_dt
+                and disponibile_da_dt > etoa_dt
+                and disponibile_da_dt.date() == eff_eta_dt.date()
             ):
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
-                        severity="warning",
+                        severity="warning" if has_gps else "info",
                         title=f"Arrivo fuori finestra: {bg}",
                         message=(
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
@@ -249,6 +259,114 @@ class ETAOrariCheck(BaseCheck):
                     f"  {bg}: nessun alert — eff_eta={eff_eta_iso}, "
                     f"etoa={etoa_str}, scarico={data_scarico}, gps={verifica_gps}"
                 )
+          except Exception as e:
+            logger.error(f"  Errore check BG {entry.get('bg', '?')}: {e}", exc_info=True)
+
+        # Scenario D: impatto a catena — ritardo su BG corrente compromette BG successivi
+        for entry in entries:
+            try:
+                chain_alerts = self._check_chain_impact(
+                    entry, viaggi_by_bg, planner_client, data_str
+                )
+                alerts.extend(chain_alerts)
+            except Exception as e:
+                logger.error(f"  Chain impact check fallito per {entry.get('bg', '?')}: {e}", exc_info=True)
+
+        return alerts
+
+    def _check_chain_impact(self, entry, viaggi_by_bg, planner_client, data_str):
+        """Verifica se ritardo su BG corrente compromette BG successivi dello stesso autista."""
+        alerts = []
+        bg_in_corso = entry["bg"].upper()
+        bg_list = entry.get("bg_list_ordered", [])
+        driver = entry["driver"]
+        plate = entry["plate"]
+        eta_result = entry["eta_result"]
+
+        disponibile_da_str = eta_result.get("disponibile_da")
+        disponibile_da_dt = _parse_iso(disponibile_da_str)
+        if not disponibile_da_dt or not bg_list:
+            return alerts
+
+        # Trova posizione bg_in_corso, prendi solo successivi
+        try:
+            idx = bg_list.index(bg_in_corso)
+        except ValueError:
+            return alerts
+
+        subsequent_bgs = bg_list[idx + 1:]
+        if not subsequent_bgs:
+            return alerts
+
+        verifica_gps = eta_result.get("verifica_gps", "")
+        has_gps = verifica_gps in ("ritardo", "confermato")
+
+        for next_bg in subsequent_bgs:
+            # Recupera data_scarico del BG successivo
+            viaggio = viaggi_by_bg.get(next_bg, {})
+            data_scarico = _normalize_date(_get_viaggio_field(viaggio, "data_scarico"))
+
+            if not data_scarico:
+                try:
+                    stato = planner_client.execute_tool(
+                        "cerca_stato_ordine", {"codice": next_bg}
+                    )
+                    raw = _normalize_date(stato.get("data_consegna", ""))
+                    if raw and raw > "2000-01-01":
+                        data_scarico = raw
+                except Exception as e:
+                    logger.warning(f"  cerca_stato_ordine fallito per {next_bg}: {e}")
+                    continue
+
+            if not data_scarico:
+                continue
+
+            # Skip BG con scarico futuro rispetto al giorno di check
+            if data_scarico > data_str:
+                continue
+
+            deadline_dt = _parse_iso(data_scarico + "T23:59:59")
+            if not deadline_dt:
+                continue
+
+            # Pianificazione compromessa: disponibile_da supera deadline del BG successivo
+            compromesso = disponibile_da_dt > deadline_dt
+            if compromesso:
+                severity = "critical"
+            elif has_gps:
+                severity = "warning"
+            else:
+                severity = "info"
+
+            # Alert solo se compromesso o GPS conferma ritardo
+            if not compromesso and verifica_gps != "ritardo":
+                continue
+
+            luogo_scarico_next = _get_viaggio_field(viaggio, "arrivo", "luogo_scarico")
+            alerts.append(CheckAlert(
+                check_name=self.name,
+                severity=severity,
+                title=f"Impatto a catena: {next_bg}",
+                message=(
+                    f"Autista **{driver}** ({plate}) — ritardo su BG [{bg_in_corso}] "
+                    f"{'compromette' if compromesso else 'potrebbe impattare'} BG successivo [{next_bg}]"
+                    f"{' — ' + luogo_scarico_next if luogo_scarico_next else ''}.\n"
+                    f"Disponibile da: **{_format_dt_it(disponibile_da_str)}**, "
+                    f"consegna {next_bg} prevista entro: {data_scarico}."
+                ),
+                context={
+                    "bg": bg_in_corso,
+                    "bg_impattato": next_bg,
+                    "targa": plate,
+                    "autista": driver,
+                    "disponibile_da": disponibile_da_str,
+                    "data_scarico_next": data_scarico,
+                    "data": data_str,
+                },
+                entity_type="trailer",
+                entity_id=plate,
+                dedup_key=f"chain_impact:{bg_in_corso}:{next_bg}:{plate}",
+            ))
 
         return alerts
 
@@ -263,10 +381,10 @@ class ETAOrariCheck(BaseCheck):
                 continue
 
             planning_text = row.get("planning") or ""
-            bg_codes = BG_REGEX.findall(planning_text)
+            bg_list_ordered = [bg.upper() for bg in BG_REGEX.findall(planning_text)]
 
             # Controlla se almeno un BG della riga è nel filtro
-            matching_bgs = [bg for bg in bg_codes if bg.upper() in bg_filter_upper]
+            matching_bgs = [bg for bg in bg_list_ordered if bg.upper() in bg_filter_upper]
             if not matching_bgs:
                 continue
 
@@ -306,7 +424,7 @@ class ETAOrariCheck(BaseCheck):
                 f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
             )
             logger.debug(f"  get_eta_per_autista response: {eta_result}")
-            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
+            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result, "bg_list_ordered": bg_list_ordered})
         return entries
 
     def _resolve_all_entries(self, planning_rows, planner_client, data_str):
@@ -319,7 +437,8 @@ class ETAOrariCheck(BaseCheck):
                 continue
 
             planning_text = row.get("planning") or ""
-            row_bgs = {bg.upper() for bg in BG_REGEX.findall(planning_text)}
+            bg_list_ordered = [bg.upper() for bg in BG_REGEX.findall(planning_text)]
+            row_bgs = set(bg_list_ordered)
             if not row_bgs:
                 continue
 
@@ -364,7 +483,7 @@ class ETAOrariCheck(BaseCheck):
                 f"ETOA: {eta_result.get('etoa_orario')}, metodo: {eta_result.get('metodo')}"
             )
             logger.debug(f"  get_eta_per_autista response: {eta_result}")
-            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result})
+            entries.append({"bg": bg, "driver": driver, "plate": plate, "eta_result": eta_result, "bg_list_ordered": bg_list_ordered})
         return entries
 
 
