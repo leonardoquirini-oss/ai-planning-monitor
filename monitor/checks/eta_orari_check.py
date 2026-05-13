@@ -34,6 +34,17 @@ def _format_dt_it(iso_str: str) -> str:
         return iso_str
 
 
+def _format_date_it(date_str: str) -> str:
+    """Formatta data ISO (2026-05-08) -> italiano (08/05/2026)."""
+    if not date_str:
+        return date_str
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d/%m/%Y")
+    except (ValueError, TypeError):
+        return date_str
+
+
 def _get_viaggio_field(viaggio: dict, *keys: str, default: str = "") -> str:
     """Cerca il primo campo presente tra i nomi alternativi."""
     for k in keys:
@@ -172,7 +183,7 @@ class ETAOrariCheck(BaseCheck):
                 "luogo_carico": luogo_carico,
             }
 
-            eta_teorico_display = eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
+            eta_teorico_display = eta_result.get("eta_data", "") or eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
             has_gps = verifica_gps in ("ritardo", "confermato")
             alert_fired = False
 
@@ -185,9 +196,8 @@ class ETAOrariCheck(BaseCheck):
                         title=f"Ritardo GPS: {bg}",
                         message=(
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
-                            f"ETA teorico: {eta_teorico_display}, "
-                            f"**ETA GPS: {eff_eta_display}** (+{ritardo_minuti} min).\n"
-                            f"{verifica_dettagli}"
+                            f"ETA teorico: **{eta_teorico_display}**, "
+                            f"ETA GPS: **{eff_eta_display}** (+{ritardo_minuti} min)."
                         ),
                         context=alert_context,
                         entity_type="trailer",
@@ -213,7 +223,7 @@ class ETAOrariCheck(BaseCheck):
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
                             f"ETA: {eta_teorico_display}, "
                             f"disponibilità spostata a **{_format_dt_it(disponibile_da_str)}**.\n"
-                            f"Consegna prevista entro: {data_scarico}.\n"
+                            f"Consegna prevista entro: {_format_date_it(data_scarico)}.\n"
                             f"{etoa_detail}"
                         ),
                         context=alert_context,
@@ -300,11 +310,15 @@ class ETAOrariCheck(BaseCheck):
 
         verifica_gps = eta_result.get("verifica_gps", "")
         has_gps = verifica_gps in ("ritardo", "confermato")
+        ritardo_minuti = eta_result.get("ritardo_minuti", 0) or 0
+        luogo_scarico_corrente = eta_result.get("luogo_scarico", "")
 
         for next_bg in subsequent_bgs:
-            # Recupera data_scarico del BG successivo
+            # Recupera info BG successivo
             viaggio = viaggi_by_bg.get(next_bg, {})
             data_scarico = _normalize_date(_get_viaggio_field(viaggio, "data_scarico"))
+            luogo_carico_next = _get_viaggio_field(viaggio, "partenza", "luogo_carico")
+            luogo_scarico_next = _get_viaggio_field(viaggio, "arrivo", "luogo_scarico")
 
             if not data_scarico:
                 try:
@@ -314,6 +328,8 @@ class ETAOrariCheck(BaseCheck):
                     raw = _normalize_date(stato.get("data_consegna", ""))
                     if raw and raw > "2000-01-01":
                         data_scarico = raw
+                    luogo_carico_next = luogo_carico_next or stato.get("luogo_carico", "")
+                    luogo_scarico_next = luogo_scarico_next or stato.get("luogo_scarico", "")
                 except Exception as e:
                     logger.warning(f"  cerca_stato_ordine fallito per {next_bg}: {e}")
                     continue
@@ -342,18 +358,39 @@ class ETAOrariCheck(BaseCheck):
             if not compromesso and verifica_gps != "ritardo":
                 continue
 
-            luogo_scarico_next = _get_viaggio_field(viaggio, "arrivo", "luogo_scarico")
+            # Calcola distanza verso luogo carico successivo
+            distanza_km = None
+            if luogo_scarico_corrente and luogo_carico_next:
+                try:
+                    dist_result = planner_client.execute_tool(
+                        "calcola_distanza",
+                        {"origine": luogo_scarico_corrente, "destinazione": luogo_carico_next},
+                    )
+                    distanza_km = dist_result.get("distanza_km") or dist_result.get("km")
+                except Exception as e:
+                    logger.warning(f"  calcola_distanza fallito {luogo_scarico_corrente} → {luogo_carico_next}: {e}")
+
+            # Costruisci messaggio dettagliato
+            msg_lines = [
+                f"Autista **{driver}** ({plate}) — ritardo di **{ritardo_minuti} min** su BG [{bg_in_corso}] "
+                f"{'compromette' if compromesso else 'potrebbe impattare'} BG successivo [{next_bg}].",
+                f"Libero da BG corrente: **{_format_dt_it(disponibile_da_str)}**.",
+            ]
+            if luogo_carico_next:
+                msg_lines.append(f"Prossimo carico: **{luogo_carico_next}**" + (
+                    f" (distanza: {distanza_km:.0f} km)" if distanza_km else ""
+                ) + ".")
+            consegna_str = f"Consegna [{next_bg}]:"
+            if luogo_scarico_next:
+                msg_lines.append(f"{consegna_str} **{luogo_scarico_next}**, entro **{_format_date_it(data_scarico)}**.")
+            else:
+                msg_lines.append(f"{consegna_str} entro **{_format_date_it(data_scarico)}**.")
+
             alerts.append(CheckAlert(
                 check_name=self.name,
                 severity=severity,
                 title=f"Impatto a catena: {next_bg}",
-                message=(
-                    f"Autista **{driver}** ({plate}) — ritardo su BG [{bg_in_corso}] "
-                    f"{'compromette' if compromesso else 'potrebbe impattare'} BG successivo [{next_bg}]"
-                    f"{' — ' + luogo_scarico_next if luogo_scarico_next else ''}.\n"
-                    f"Disponibile da: **{_format_dt_it(disponibile_da_str)}**, "
-                    f"consegna {next_bg} prevista entro: {data_scarico}."
-                ),
+                message="\n".join(msg_lines),
                 context={
                     "bg": bg_in_corso,
                     "bg_impattato": next_bg,
@@ -361,6 +398,10 @@ class ETAOrariCheck(BaseCheck):
                     "autista": driver,
                     "disponibile_da": disponibile_da_str,
                     "data_scarico_next": data_scarico,
+                    "luogo_carico_next": luogo_carico_next,
+                    "luogo_scarico_next": luogo_scarico_next,
+                    "distanza_km": distanza_km,
+                    "ritardo_minuti": ritardo_minuti,
                     "data": data_str,
                 },
                 entity_type="trailer",
