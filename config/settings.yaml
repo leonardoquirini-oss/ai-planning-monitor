@@ -37,7 +37,7 @@ server:
 
 # Monitor
 monitor:
-  check_interval_seconds: 300
+  check_interval_seconds: 1800
   dedup_ttl_hours: 8
   checks:
     eta_orari:

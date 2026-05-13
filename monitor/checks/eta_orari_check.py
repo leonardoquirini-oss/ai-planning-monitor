@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, time as dtime
 from typing import List
 
 from models import CheckAlert
@@ -75,6 +75,59 @@ def _effective_eta(eta_result: dict):
     eta = eta_result.get("eta", "")
     eta_display = eta_result.get("eta_orario", "") or _format_dt_it(eta)
     return eta, eta_display, False
+
+
+def _find_next_opening(arrival_dt: datetime, orari: dict):
+    """Trova prossima finestra aperta dopo arrival_dt.
+
+    Returns:
+        datetime se arrivo dentro finestra o prima di una finestra successiva.
+        None se arrivo dopo chiusura pomeridiana (giorno dopo necessario).
+    """
+    if not orari:
+        return arrival_dt  # fallback: nessun vincolo orario
+
+    windows = []
+    for fascia in ("mattina", "pomeriggio"):
+        w = orari.get(fascia)
+        if w and w.get("dalle") and w.get("alle"):
+            try:
+                dalle = dtime.fromisoformat(w["dalle"])
+                alle = dtime.fromisoformat(w["alle"])
+                windows.append((dalle, alle))
+            except (ValueError, TypeError):
+                pass
+
+    if not windows:
+        return arrival_dt  # nessun orario configurato
+
+    windows.sort(key=lambda x: x[0])
+    arr_time = arrival_dt.time()
+
+    for dalle, alle in windows:
+        if dalle <= arr_time <= alle:
+            return arrival_dt  # dentro finestra
+        if arr_time < dalle:
+            return arrival_dt.replace(hour=dalle.hour, minute=dalle.minute, second=0)
+
+    return None  # dopo ultima finestra
+
+
+def _get_distance_json(planner_client, origine, destinazione, cache):
+    """Chiama calcola_distanza con formato JSON, con cache."""
+    key = (origine.strip().lower(), destinazione.strip().lower())
+    if key in cache:
+        return cache[key]
+    result = planner_client.execute_tool(
+        "calcola_distanza",
+        {"origine": origine, "destinazione": destinazione, "formato": "json"},
+    )
+    parsed = {
+        "distanza_km": result.get("distanza_km") or result.get("km"),
+        "duration_min": result.get("duration_min") or result.get("tempo_min"),
+    }
+    cache[key] = parsed
+    return parsed
 
 
 class ETAOrariCheck(BaseCheck):
@@ -183,12 +236,15 @@ class ETAOrariCheck(BaseCheck):
                 "luogo_carico": luogo_carico,
             }
 
-            eta_teorico_display = eta_result.get("eta_data", "") or eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
-            has_gps = verifica_gps in ("ritardo", "confermato")
+            # Display: eta_data = finale, eta_missione_orario = teorico, eta_gps_orario = GPS
+            eta_finale_display = eta_result.get("eta_data", "") or eta_result.get("eta_orario", "") or _format_dt_it(eta_str)
+            eta_missione_display = eta_result.get("eta_missione_orario", "") or _format_dt_it(eta_result.get("eta_missione", ""))
+            eta_gps_display = eta_result.get("eta_gps_orario", "") or _format_dt_it(eta_result.get("eta_gps", ""))
+            has_gps = verifica_gps in ("ritardo", "confermato", "anticipo")
             alert_fired = False
 
-            # Scenario A: GPS rileva ritardo — alert SEMPRE
-            if is_gps_delayed:
+            # Scenario A: GPS rileva ritardo — alert solo se ritardo effettivo > 0
+            if is_gps_delayed and ritardo_minuti > 0:
                 alerts.append(
                     CheckAlert(
                         check_name=self.name,
@@ -196,8 +252,8 @@ class ETAOrariCheck(BaseCheck):
                         title=f"Ritardo GPS: {bg}",
                         message=(
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
-                            f"ETA teorico: **{eta_teorico_display}**, "
-                            f"ETA GPS: **{eff_eta_display}** (+{ritardo_minuti} min)."
+                            f"ETA missione: **{eta_missione_display}**, "
+                            f"ETA GPS: **{eta_gps_display}** (+{ritardo_minuti} min)."
                         ),
                         context=alert_context,
                         entity_type="trailer",
@@ -221,7 +277,7 @@ class ETAOrariCheck(BaseCheck):
                         title=f"ETA fuori orario: {bg}",
                         message=(
                             f"Autista **{driver}** ({plate}) per BG [{bg}] — {luogo_scarico}\n"
-                            f"ETA: {eta_teorico_display}, "
+                            f"ETA: {eta_finale_display}, "
                             f"disponibilità spostata a **{_format_dt_it(disponibile_da_str)}**.\n"
                             f"Consegna prevista entro: {_format_date_it(data_scarico)}.\n"
                             f"{etoa_detail}"
@@ -285,7 +341,19 @@ class ETAOrariCheck(BaseCheck):
         return alerts
 
     def _check_chain_impact(self, entry, viaggi_by_bg, planner_client, data_str):
-        """Verifica se ritardo su BG corrente compromette BG successivi dello stesso autista."""
+        """Verifica se ritardo su BG corrente compromette BG successivi dello stesso autista.
+
+        Simula viaggio completo per ogni BG successivo:
+        1. Viaggio a vuoto (scarico corrente → carico successivo)
+        2. Verifica orari sede CARICO
+        3. Viaggio carico (carico → scarico successivo)
+        4. Verifica orari sede SCARICO
+        Severity CRITICAL se simulazione mostra impossibilita' consegna in orario.
+        """
+        TEMPO_CARICO_ORE = 1.5
+        TEMPO_SCARICO_ORE = 2.0
+        MARGIN_WARNING_MIN = 60
+
         alerts = []
         bg_in_corso = entry["bg"].upper()
         bg_list = entry.get("bg_list_ordered", [])
@@ -298,7 +366,6 @@ class ETAOrariCheck(BaseCheck):
         if not disponibile_da_dt or not bg_list:
             return alerts
 
-        # Trova posizione bg_in_corso, prendi solo successivi
         try:
             idx = bg_list.index(bg_in_corso)
         except ValueError:
@@ -309,12 +376,19 @@ class ETAOrariCheck(BaseCheck):
             return alerts
 
         verifica_gps = eta_result.get("verifica_gps", "")
-        has_gps = verifica_gps in ("ritardo", "confermato")
         ritardo_minuti = eta_result.get("ritardo_minuti", 0) or 0
         luogo_scarico_corrente = eta_result.get("luogo_scarico", "")
 
+        # Alert solo se GPS conferma ritardo
+        if verifica_gps != "ritardo":
+            return alerts
+
+        current_time = disponibile_da_dt
+        current_location = luogo_scarico_corrente
+        dist_cache = {}
+
         for next_bg in subsequent_bgs:
-            # Recupera info BG successivo
+            # --- Recupera info BG successivo ---
             viaggio = viaggi_by_bg.get(next_bg, {})
             data_scarico = _normalize_date(_get_viaggio_field(viaggio, "data_scarico"))
             luogo_carico_next = _get_viaggio_field(viaggio, "partenza", "luogo_carico")
@@ -341,45 +415,97 @@ class ETAOrariCheck(BaseCheck):
             if data_scarico > data_str:
                 continue
 
-            deadline_dt = _parse_iso(data_scarico + "T23:59:59")
-            if not deadline_dt:
-                continue
+            data_scarico_date = datetime.strptime(data_scarico, "%Y-%m-%d").date()
 
-            # Pianificazione compromessa: disponibile_da supera deadline del BG successivo
-            compromesso = disponibile_da_dt > deadline_dt
-            if compromesso:
-                severity = "critical"
-            elif has_gps:
-                severity = "warning"
-            else:
-                severity = "info"
+            # --- Simulazione viaggio ---
+            can_simulate = bool(current_location and luogo_carico_next and luogo_scarico_next)
+            origin_location = current_location  # salva prima che venga aggiornato
+            sim_ok = False
+            severity = "warning"
+            sim_details = {}
 
-            # Alert solo se compromesso o GPS conferma ritardo
-            if not compromesso and verifica_gps != "ritardo":
-                continue
-
-            # Calcola distanza verso luogo carico successivo
-            distanza_km = None
-            if luogo_scarico_corrente and luogo_carico_next:
+            if can_simulate:
                 try:
-                    dist_result = planner_client.execute_tool(
-                        "calcola_distanza",
-                        {"origine": luogo_scarico_corrente, "destinazione": luogo_carico_next},
+                    sim_details = self._simulate_chain_trip(
+                        planner_client, next_bg, current_time, current_location,
+                        luogo_carico_next, luogo_scarico_next, data_scarico,
+                        data_scarico_date, TEMPO_CARICO_ORE, TEMPO_SCARICO_ORE,
+                        MARGIN_WARNING_MIN, dist_cache,
                     )
-                    distanza_km = dist_result.get("distanza_km") or dist_result.get("km")
-                except Exception as e:
-                    logger.warning(f"  calcola_distanza fallito {luogo_scarico_corrente} → {luogo_carico_next}: {e}")
+                    severity = sim_details["severity"]
+                    sim_ok = True
 
-            # Costruisci messaggio dettagliato
+                    # Aggiorna stato catena per BG seguente
+                    if sim_details.get("next_disponibile_da"):
+                        current_time = sim_details["next_disponibile_da"]
+                        current_location = luogo_scarico_next
+
+                    # Se simulazione OK con margine ampio, catena recuperata
+                    if severity == "ok":
+                        logger.info(f"  Chain {bg_in_corso} → {next_bg}: simulazione OK, catena recuperata")
+                        break
+
+                except Exception as e:
+                    logger.warning(f"  Simulazione fallita per {next_bg}: {e}")
+
+            # Fallback senza simulazione
+            if not sim_ok:
+                deadline_dt = _parse_iso(data_scarico + "T23:59:59")
+                if deadline_dt and current_time > deadline_dt:
+                    severity = "critical"
+                else:
+                    severity = "warning"
+
+            if severity == "ok":
+                continue
+
+            # --- Costruisci messaggio ---
+            compromette = severity == "critical"
             msg_lines = [
                 f"Autista **{driver}** ({plate}) — ritardo di **{ritardo_minuti} min** su BG [{bg_in_corso}] "
-                f"{'compromette' if compromesso else 'potrebbe impattare'} BG successivo [{next_bg}].",
+                f"{'compromette' if compromette else 'potrebbe impattare'} BG successivo [{next_bg}].",
                 f"Libero da BG corrente: **{_format_dt_it(disponibile_da_str)}**.",
             ]
-            if luogo_carico_next:
-                msg_lines.append(f"Prossimo carico: **{luogo_carico_next}**" + (
-                    f" (distanza: {distanza_km:.0f} km)" if distanza_km else ""
-                ) + ".")
+
+            if sim_ok:
+                # Dettagli simulazione viaggio a vuoto
+                dist_empty = sim_details.get("distanza_empty_km")
+                dur_empty = sim_details.get("duration_empty_min")
+                arrivo_carico = sim_details.get("arrivo_carico_dt")
+                carico_status = sim_details.get("carico_status", "")
+
+                if dist_empty and dur_empty:
+                    ore_e = dur_empty / 60
+                    msg_lines.append(
+                        f"Viaggio a vuoto: {origin_location or '?'} → {luogo_carico_next} "
+                        f"({dist_empty:.0f} km, ~{ore_e:.1f}h)."
+                    )
+                if arrivo_carico:
+                    msg_lines.append(
+                        f"Arrivo carico stimato: **{arrivo_carico.strftime('%d/%m/%Y %H:%M')}** — {carico_status}."
+                    )
+
+                # Dettagli simulazione viaggio carico
+                dist_loaded = sim_details.get("distanza_loaded_km")
+                dur_loaded = sim_details.get("duration_loaded_min")
+                arrivo_scarico = sim_details.get("arrivo_scarico_dt")
+                scarico_status = sim_details.get("scarico_status", "")
+
+                if dist_loaded and dur_loaded:
+                    ore_l = dur_loaded / 60
+                    msg_lines.append(
+                        f"Viaggio carico: {luogo_carico_next} → {luogo_scarico_next} "
+                        f"({dist_loaded:.0f} km, ~{ore_l:.1f}h)."
+                    )
+                if arrivo_scarico:
+                    msg_lines.append(
+                        f"Arrivo scarico stimato: **{arrivo_scarico.strftime('%d/%m/%Y %H:%M')}** — {scarico_status}."
+                    )
+            else:
+                # Fallback: solo info base
+                if luogo_carico_next:
+                    msg_lines.append(f"Prossimo carico: **{luogo_carico_next}** (simulazione non disponibile).")
+
             consegna_str = f"Consegna [{next_bg}]:"
             if luogo_scarico_next:
                 msg_lines.append(f"{consegna_str} **{luogo_scarico_next}**, entro **{_format_date_it(data_scarico)}**.")
@@ -400,9 +526,9 @@ class ETAOrariCheck(BaseCheck):
                     "data_scarico_next": data_scarico,
                     "luogo_carico_next": luogo_carico_next,
                     "luogo_scarico_next": luogo_scarico_next,
-                    "distanza_km": distanza_km,
                     "ritardo_minuti": ritardo_minuti,
                     "data": data_str,
+                    **(sim_details.get("context_extra", {})),
                 },
                 entity_type="trailer",
                 entity_id=plate,
@@ -410,6 +536,116 @@ class ETAOrariCheck(BaseCheck):
             ))
 
         return alerts
+
+    def _simulate_chain_trip(self, planner_client, next_bg,
+                             start_time, start_location,
+                             carico_location, scarico_location,
+                             data_scarico_str, data_scarico_date,
+                             tempo_carico_ore, tempo_scarico_ore,
+                             margin_warning_min, dist_cache):
+        """Simula viaggio completo per un BG successivo nella catena.
+
+        Returns dict con: severity, arrivo_carico_dt, arrivo_scarico_dt,
+        distanza_empty_km, duration_empty_min, distanza_loaded_km, duration_loaded_min,
+        carico_status, scarico_status, next_disponibile_da, context_extra.
+        """
+        result = {"severity": "warning", "context_extra": {}}
+
+        # --- Leg 1: viaggio a vuoto ---
+        dist_empty = _get_distance_json(planner_client, start_location, carico_location, dist_cache)
+        km_empty = dist_empty.get("distanza_km") or 0
+        dur_empty = dist_empty.get("duration_min") or 0
+        result["distanza_empty_km"] = km_empty
+        result["duration_empty_min"] = dur_empty
+
+        arrivo_carico_dt = start_time + timedelta(minutes=dur_empty)
+        result["arrivo_carico_dt"] = arrivo_carico_dt
+
+        # --- Orari sede CARICO ---
+        effective_carico_dt = arrivo_carico_dt
+        carico_status = "dentro finestra"
+        try:
+            orari_carico = planner_client.execute_tool(
+                "check_orari_sede",
+                {"bg": next_bg, "data": arrivo_carico_dt.strftime("%Y-%m-%d"), "tipo": "CARICO"},
+            )
+            orari_c = orari_carico.get("orari", {})
+            opening = _find_next_opening(arrivo_carico_dt, orari_c)
+            if opening is None:
+                # Dopo chiusura pomeridiana → giorno dopo, prima finestra mattina
+                next_day = arrivo_carico_dt.date() + timedelta(days=1)
+                mattina = orari_c.get("mattina", {})
+                dalle_str = mattina.get("dalle", "08:00")
+                dalle_t = dtime.fromisoformat(dalle_str)
+                effective_carico_dt = datetime.combine(next_day, dalle_t)
+                carico_status = f"fuori finestra (attesa fino a {effective_carico_dt.strftime('%d/%m %H:%M')})"
+            elif opening > arrivo_carico_dt:
+                effective_carico_dt = opening
+                carico_status = f"attesa apertura ({effective_carico_dt.strftime('%H:%M')})"
+        except Exception as e:
+            logger.warning(f"  check_orari_sede CARICO fallito per {next_bg}: {e}")
+
+        result["carico_status"] = carico_status
+        result["context_extra"]["arrivo_carico_stimato"] = arrivo_carico_dt.isoformat()
+        result["context_extra"]["carico_status"] = carico_status
+
+        # Partenza da carico (dopo operazioni carico)
+        partenza_carico_dt = effective_carico_dt + timedelta(hours=tempo_carico_ore)
+
+        # --- Leg 2: viaggio carico ---
+        dist_loaded = _get_distance_json(planner_client, carico_location, scarico_location, dist_cache)
+        km_loaded = dist_loaded.get("distanza_km") or 0
+        dur_loaded = dist_loaded.get("duration_min") or 0
+        result["distanza_loaded_km"] = km_loaded
+        result["duration_loaded_min"] = dur_loaded
+
+        arrivo_scarico_dt = partenza_carico_dt + timedelta(minutes=dur_loaded)
+        result["arrivo_scarico_dt"] = arrivo_scarico_dt
+
+        # --- Orari sede SCARICO ---
+        scarico_status = "dentro finestra"
+        effective_scarico_dt = arrivo_scarico_dt
+        try:
+            orari_scarico = planner_client.execute_tool(
+                "check_orari_sede",
+                {"bg": next_bg, "data": arrivo_scarico_dt.strftime("%Y-%m-%d"), "tipo": "SCARICO"},
+            )
+            orari_s = orari_scarico.get("orari", {})
+            opening_s = _find_next_opening(arrivo_scarico_dt, orari_s)
+            if opening_s is None:
+                scarico_status = "FUORI ORARIO — NON FATTIBILE"
+            elif opening_s > arrivo_scarico_dt:
+                effective_scarico_dt = opening_s
+                scarico_status = f"attesa apertura ({effective_scarico_dt.strftime('%H:%M')})"
+        except Exception as e:
+            logger.warning(f"  check_orari_sede SCARICO fallito per {next_bg}: {e}")
+
+        result["scarico_status"] = scarico_status
+        result["context_extra"]["arrivo_scarico_stimato"] = arrivo_scarico_dt.isoformat()
+        result["context_extra"]["scarico_status"] = scarico_status
+        result["context_extra"]["distanza_empty_km"] = km_empty
+        result["context_extra"]["distanza_loaded_km"] = km_loaded
+
+        # --- Severity ---
+        arrivo_date = arrivo_scarico_dt.date()
+        if arrivo_date > data_scarico_date:
+            # Arrivo giorno dopo la data di consegna
+            result["severity"] = "critical"
+        elif scarico_status.startswith("FUORI ORARIO") and arrivo_date >= data_scarico_date:
+            # Arrivo dopo chiusura sede nel giorno di consegna
+            result["severity"] = "critical"
+        elif effective_scarico_dt and effective_scarico_dt != arrivo_scarico_dt:
+            # Deve aspettare apertura ma riesce — warning se margine stretto
+            result["severity"] = "warning"
+        else:
+            # Simulazione OK — consegna fattibile
+            result["severity"] = "ok"
+
+        # next_disponibile_da per catena successiva
+        if effective_scarico_dt and not scarico_status.startswith("FUORI ORARIO"):
+            result["next_disponibile_da"] = effective_scarico_dt + timedelta(hours=tempo_scarico_ore)
+
+        return result
 
     def _resolve_bg_entries(self, bg_filter, planning_rows, planner_client, data_str):
         """Fast path: filtra planning_rows per BG richiesti, poi calcola ETA solo per quelli."""
